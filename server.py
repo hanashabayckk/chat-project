@@ -5,9 +5,9 @@ Three listeners, one shared chat room (group chat) + SQLite history:
   - HTTP               (port 8000)  -> serves the web page and /stats metrics
 """
 import asyncio, json, sqlite3, threading, time, functools
-from collections import deque
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from websockets.asyncio.server import serve
+import metrics
 
 HOST, HTTP_PORT, WS_PORT, TCP_PORT = "0.0.0.0", 8000, 8765, 9000
 MAX_NAME = 20      
@@ -27,16 +27,6 @@ def history_after(last_id):
     return db.execute("SELECT id,sender,text,ts FROM messages WHERE id>? ORDER BY id",
                       (last_id,)).fetchall()
 
-# ---------- metrics ----------
-stats = {"active": 0, "total_connections": 0, "messages": 0, "bytes_in": 0, "bytes_out": 0}
-recent = deque()  # timestamps of recent messages, for messages/sec
-
-def snapshot():
-    now = time.time()
-    while recent and now - recent[0] > 10:
-        recent.popleft()
-    return {**stats, "msgs_per_sec_last10s": round(len(recent) / 10, 2)}
-
 # ---------- connected clients: each has an async send(id,sender,text,ts) ----------
 clients = set()
 
@@ -52,22 +42,21 @@ async def handle_message(name, text):
     if not text:
         return
     mid, ts = save(name, text)
-    stats["messages"] += 1
-    recent.append(time.time())
+    metrics.record_message()
     await broadcast(mid, name, text, ts)
 
 class WSClient:
     def __init__(self, ws): self.ws = ws
     async def send(self, mid, sender, text, ts):
         data = json.dumps({"type": "msg", "id": mid, "sender": sender, "text": text, "ts": ts})
-        stats["bytes_out"] += len(data)
+        metrics.stats["bytes_out"] += len(data)
         await self.ws.send(data)
 
 class TCPClient:
     def __init__(self, writer): self.w = writer
     async def send(self, mid, sender, text, ts):
         data = f"MSG|{mid}|{sender}|{text}\n".encode()
-        stats["bytes_out"] += len(data)
+        metrics.stats["bytes_out"] += len(data)
         self.w.write(data)
         await self.w.drain()
 
@@ -75,10 +64,10 @@ class TCPClient:
 # client -> {"type":"hello","name":"Ali","last_id":0} then {"type":"msg","text":"hi"}
 async def ws_handler(ws):
     client, name = WSClient(ws), None
-    stats["active"] += 1; stats["total_connections"] += 1
+    metrics.stats["active"] += 1; metrics.stats["total_connections"] += 1
     try:
         async for raw in ws:
-            stats["bytes_in"] += len(raw)
+            metrics.stats["bytes_in"] += len(raw)
             m = json.loads(raw)
             if m["type"] == "hello":
                 name = m["name"]
@@ -90,7 +79,7 @@ async def ws_handler(ws):
     except Exception as e:
         print("ws client error:", e)
     finally:
-        clients.discard(client); stats["active"] -= 1
+        clients.discard(client); metrics.stats["active"] -= 1
 
 # ---------- protocol 2: custom TCP text lines ----------
 # client -> "HELLO|name|last_id\n" then "MSG|text\n"
@@ -101,14 +90,14 @@ async def tcp_handler(reader, writer):
     client, name = TCPClient(writer), None
 
     # metrics update where active= n of clients that are connected rn & total_connection= n of clients that has ever connected
-    stats["active"] += 1; stats["total_connections"] += 1
+    metrics.stats["active"] += 1; metrics.stats["total_connections"] += 1
 
     try:
-    # waits until receives lines ending in /n & this is the protocol framing, when disconnected returnd an empty val & loop ends
+        # waits until receives lines ending in /n & this is the protocol framing, when disconnected returnd an empty val & loop ends
         while line := await reader.readline():
 
             # Adds the size of the received line to the bytes-received counter
-            stats["bytes_in"] += len(line)
+            metrics.stats["bytes_in"] += len(line)
 
              # Turns the raw bytes into text, removes the trailing newline, and splits at most 2 times
             parts = line.decode().rstrip("\n").split("|", 2)
@@ -144,14 +133,14 @@ async def tcp_handler(reader, writer):
     except Exception as e:
         print("tcp client error:", e)
     finally:
-        clients.discard(client); stats["active"] -= 1
+        clients.discard(client); metrics.stats["active"] -= 1
         writer.close()
 
 # ---------- HTTP: static page + /stats ----------
 class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/stats":
-            body = json.dumps(snapshot(), indent=2).encode()
+            body = json.dumps(metrics.snapshot(), indent=2).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers(); self.wfile.write(body)
