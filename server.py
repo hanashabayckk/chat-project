@@ -10,7 +10,8 @@ from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from websockets.asyncio.server import serve
 
 HOST, HTTP_PORT, WS_PORT, TCP_PORT = "0.0.0.0", 8000, 8765, 9000
-
+MAX_NAME = 20      
+MAX_TEXT = 500     
 # ---------- storage: every message gets a unique increasing id ----------
 db = sqlite3.connect("chat.db", check_same_thread=False)
 db.execute("CREATE TABLE IF NOT EXISTS messages("
@@ -93,20 +94,53 @@ async def ws_handler(ws):
 
 # ---------- protocol 2: custom TCP text lines ----------
 # client -> "HELLO|name|last_id\n" then "MSG|text\n"
+# the next line is a fn ran once for each client that connects over TCP & reader is how the server receives bytes from that client, and writer is how it sends bytes back
 async def tcp_handler(reader, writer):
+
+    # Creating a TCPclient obj that wraps the connection , none is his name
     client, name = TCPClient(writer), None
+
+    # metrics update where active= n of clients that are connected rn & total_connection= n of clients that has ever connected
     stats["active"] += 1; stats["total_connections"] += 1
+
     try:
+    # waits until receives lines ending in /n & this is the protocol framing, when disconnected returnd an empty val & loop ends
         while line := await reader.readline():
+
+            # Adds the size of the received line to the bytes-received counter
             stats["bytes_in"] += len(line)
+
+             # Turns the raw bytes into text, removes the trailing newline, and splits at most 2 times
             parts = line.decode().rstrip("\n").split("|", 2)
             if parts[0] == "HELLO" and len(parts) == 3:
-                name = parts[1]
+                name = parts[1].strip()
+                if not name or len(name) > MAX_NAME:
+                    
+                    # the client's outgoing connection.fn queues the bytes(bytes"error message then end line to know it's complete")
+                    writer.write(b"ERR|invalid name\n")
+
+                    #lets the server serve other clients while waiting   the client's outgoing connection.fn waits until the queued bytes have actually been sent
+                    await writer.drain()
+
+                    break                      # closes this client only
+   
                 for row in history_after(int(parts[2])):
                     await client.send(*row)
                 clients.add(client)
             elif parts[0] == "MSG" and name and len(parts) >= 2:
-                await handle_message(name, "|".join(parts[1:]))
+                # rebuilds the message text
+                text = "|".join(parts[1:])
+
+                if len(text) > MAX_TEXT:
+                    # error line queued for this client only 
+                    writer.write(b"ERR|message too long\n")
+
+                    #waiting for error code to be sent 
+                    await writer.drain()
+
+                else:
+                    # saves the message and broadcasts it to everyone 
+                    await handle_message(name, text)
     except Exception as e:
         print("tcp client error:", e)
     finally:
