@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chat</title>
+<style>
+  body { margin:0; font-family:system-ui,sans-serif; display:flex; flex-direction:column; height:100vh; background:#f0f2f5; }
+  header { padding:12px; background:#1f6feb; color:#fff; font-weight:600; display:flex; justify-content:space-between; }
+  #log { flex:1; overflow-y:auto; padding:12px; display:flex; flex-direction:column; gap:6px; }
+  .m { max-width:75%; padding:8px 12px; border-radius:14px; background:#fff; word-wrap:break-word; }
+  .m small { display:block; color:#667; font-size:11px; }
+  .me { align-self:flex-end; background:#d2e4ff; }
+  form { display:flex; gap:8px; padding:8px; background:#fff; }
+  input { flex:1; padding:10px; font-size:16px; border:1px solid #ccd; border-radius:20px; }
+  button { padding:10px 16px; border:0; border-radius:20px; background:#1f6feb; color:#fff; font-size:16px; }
+</style>
+</head>
+<body>
+<header><span>Group chat</span><span id="status">connecting...</span></header>
+<div id="log"></div>
+<form id="f"><input id="t" autocomplete="off" placeholder="Message"><button>Send</button></form>
+<script>
+const name = prompt("Your name?") || "Anon";
+const seen = new Set();   // message ids already shown -> prevents duplicates
+let lastId = 0;           // highest id seen -> asked back from server on reconnect
+let ws;
+
+function show(m) {
+  if (seen.has(m.id)) return;
+  seen.add(m.id); lastId = Math.max(lastId, m.id);
+  const d = document.createElement("div");
+  d.className = "m" + (m.sender === name ? " me" : "");
+  const s = document.createElement("small"); s.textContent = m.sender;
+  d.append(s, document.createTextNode(m.text));
+  log.append(d); log.scrollTop = log.scrollHeight;
+}
+
+function connect() {
+  ws = new WebSocket(`ws://${location.hostname}:8765`);
+  ws.onopen = () => {
+    status.textContent = "online";
+    ws.send(JSON.stringify({type: "hello", name, last_id: lastId}));
+  };
+  ws.onmessage = e => show(JSON.parse(e.data));
+  ws.onclose = () => { status.textContent = "offline, retrying..."; setTimeout(connect, 1500); };
+}
+f.onsubmit = e => {
+  e.preventDefault();
+  if (t.value.trim() && ws.readyState === 1) {
+    ws.send(JSON.stringify({type: "msg", text: t.value})); t.value = "";
+  }
+};
+connect();
+</script>
+</body>
+</html>
