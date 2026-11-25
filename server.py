@@ -70,6 +70,7 @@ class TCPClient:
 async def ws_handler(ws):
     client, name = WSClient(ws), None
     metrics.stats["active"] += 1; metrics.stats["total_connections"] += 1
+    metrics.stats["ws_clients"] += 1
     try:
         async for raw in ws:
             metrics.stats["bytes_in"] += len(raw)
@@ -85,6 +86,7 @@ async def ws_handler(ws):
         print("ws client error:", e)
     finally:
         clients.discard(client); metrics.stats["active"] -= 1
+        metrics.stats["ws_clients"] -= 1
 
 # ---------- protocol 2: custom TCP text lines ----------
 # client -> "HELLO|name|last_id\n" then "MSG|text\n"
@@ -96,6 +98,7 @@ async def tcp_handler(reader, writer):
 
     # metrics update where active= n of clients that are connected rn & total_connection= n of clients that has ever connected
     metrics.stats["active"] += 1; metrics.stats["total_connections"] += 1
+    metrics.stats["tcp_clients"] += 1
 
     try:
         # waits until receives lines ending in /n & this is the protocol framing, when disconnected returnd an empty val & loop ends
@@ -138,7 +141,13 @@ async def tcp_handler(reader, writer):
     except Exception as e:
         print("tcp client error:", e)
     finally:
+        
+        #remove from broadcast list, lower the active count
         clients.discard(client); metrics.stats["active"] -= 1
+
+        metrics.stats["tcp_clients"] -= 1
+
+        #close the socket
         writer.close()
 
 # ---------- HTTP: static page + /stats ----------

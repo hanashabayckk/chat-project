@@ -2,9 +2,10 @@
 import time
 from collections import deque
 
-# counters updated by the server while it runs
+# counters updated by the server while it runs, stats is a dictionary 'a  set of named counters', active is total of ws_clients plus tcp_clients
 stats = {"active": 0, "total_connections": 0, "messages": 0,
-         "bytes_in": 0, "bytes_out": 0}
+         "bytes_in": 0, "bytes_out": 0,
+         "ws_clients": 0, "tcp_clients": 0}
 recent = deque()          # stores the time of each recent message, used for the rate
 start_time = time.time()  # when the server started
 
