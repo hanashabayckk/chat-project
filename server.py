@@ -37,14 +37,19 @@ async def broadcast(mid, sender, text, ts):
         except Exception:      # one broken client must not affect the others
             clients.discard(c)
 
-async def handle_message(name, text):
+async def handle_message(name, text, client_id=None):
     text = text.strip()
     if not text:
         return
+    if client_id:                       # only clients that send an id get protection
+        key = (name, client_id)
+        if key in seen_ids:             # already processed, so ignore the repeat
+            return
+        seen_ids.add(key)
     mid, ts = save(name, text)
     metrics.record_message()
     await broadcast(mid, name, text, ts)
-
+  
 class WSClient:
     def __init__(self, ws): self.ws = ws
     async def send(self, mid, sender, text, ts):
