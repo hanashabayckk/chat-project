@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>LAN Chat</title>
+<style>
+  :root {
+    --bg: #e9eef0; --panel: #ffffff; --ink: #1c2b33; --muted: #6b7c85;
+    --mine: #1f5f6b; --mine-ink: #ffffff; --theirs: #ffffff; --line: #d3dde1;
+    --ok: #2e9b5f; --bad: #c8453b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #11181c; --panel: #1a242a; --ink: #e6eef1; --muted: #8fa1aa;
+            --mine: #2a7f8e; --theirs: #243139; --line: #2c3a42; }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+         background: var(--bg); color: var(--ink); }
+  #app { height: 100dvh; display: flex; flex-direction: column; max-width: 720px; margin: 0 auto;
+         background: var(--bg); }
+  header { display: flex; justify-content: space-between; align-items: center; gap: 8px;
+           padding: 10px 14px; padding-top: calc(10px + env(safe-area-inset-top, 0px));
+           background: var(--panel); border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 1.05rem; margin: 0; }
+  #who { color: var(--muted); font-size: .85rem; }
+  #status { font-size: .85rem; display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+  #dot { width: 10px; height: 10px; border-radius: 50%; background: var(--bad); }
+  #status.on #dot { background: var(--ok); }
+  #log { flex: 1; overflow-y: auto; padding: 14px; display: flex; flex-direction: column; gap: 8px; }
+  .row { display: flex; flex-direction: column; max-width: 75%; }
+  .row.mine { align-self: flex-end; align-items: flex-end; }
+  .row.theirs { align-self: flex-start; align-items: flex-start; }
+  .name { font-size: .75rem; color: var(--muted); margin: 0 6px 2px; }
+  .bubble { padding: 8px 12px; border-radius: 16px; line-height: 1.35; white-space: pre-wrap;
+            overflow-wrap: anywhere; background: var(--theirs); border: 1px solid var(--line); }
+  .mine .bubble { background: var(--mine); color: var(--mine-ink); border-color: transparent;
+                  border-bottom-right-radius: 4px; }
+  .theirs .bubble { border-bottom-left-radius: 4px; }
+  .time { font-size: .7rem; color: var(--muted); margin: 2px 6px 0; }
+  .row.pending .bubble { opacity: .55; }
+  .sys { align-self: center; font-size: .75rem; color: var(--muted); }
+  #bar { display: flex; gap: 8px; padding: 10px 12px; padding-bottom: calc(10px + env(safe-area-inset-bottom, 0px));
+         background: var(--panel); border-top: 1px solid var(--line); }
+  input, button { font: inherit; font-size: 16px; } /* 16px stops iOS zoom-on-focus */
+  #text, #nameIn { flex: 1; min-width: 0; padding: 10px 14px; border-radius: 20px;
+                   border: 1px solid var(--line); background: var(--bg); color: var(--ink); }
+  button { padding: 10px 18px; border: 0; border-radius: 20px; background: var(--mine); color: #fff; cursor: pointer; }
+  #login { position: fixed; inset: 0; background: var(--bg); display: flex; align-items: center;
+           justify-content: center; padding: 20px; z-index: 5; }
+  #login > div { background: var(--panel); border: 1px solid var(--line); border-radius: 16px;
+                 padding: 22px; width: min(360px, 100%); display: flex; flex-direction: column; gap: 12px; }
+  #login h2 { margin: 0; font-size: 1.2rem; }
+  #login[hidden] { display: none; }
+</style>
+</head>
+<body>
+<div id="login">
+  <div>
+    <h2>Pick a username</h2>
+    <input id="nameIn" maxlength="20" placeholder="e.g. alice" autocomplete="off">
+    <button id="nameGo">Join chat</button>
+  </div>
+</div>
+
+<div id="app">
+  <header>
+    <div><h1>LAN Chat</h1><div id="who"></div></div>
+    <div id="status"><span id="dot"></span><span id="stText">Connecting…</span></div>
+  </header>
+  <div id="log" aria-live="polite"></div>
+  <div id="bar">
+    <input id="text" placeholder="Type a message" autocomplete="off" maxlength="1000">
+    <button id="send">Send</button>
+  </div>
+</div>
+
+<script>
+"use strict";
+// ---------- state ----------
+let user = null;
+let ws = null;
+let retry = 0;
+let lastId = 0;                 // highest server id seen THIS page session (sent in "join")
+const seen = new Set();         // server ids already rendered -> duplicate filter
+const pendingEls = new Map();   // client_id -> bubble element awaiting server echo
+let pending = [];               // [{client_id, text}] not yet confirmed by the server
+
+const $ = (id) => document.getElementById(id);
+const log = $("log");
+
+// ---------- helpers ----------
+// crypto.randomUUID needs HTTPS, so it fails on http://<laptop-ip>. Use a simple random id.
+const newClientId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+const fmtTime = (ts) => new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
+function setStatus(online) {
+  $("status").classList.toggle("on", online);
+  $("stText").textContent = online ? "Connected" : "Reconnecting…";
+}
+
+function render(m, isPending) {
+  const mine = m.user === user;
+  const row = document.createElement("div");
+  row.className = "row " + (mine ? "mine" : "theirs") + (isPending ? " pending" : "");
+  if (!mine) {
+    const n = document.createElement("div");
+    n.className = "name";
+    n.textContent = m.user;               // textContent, never innerHTML: blocks HTML/script injection
+    row.appendChild(n);
+  }
+  const b = document.createElement("div");
+  b.className = "bubble";
+  b.textContent = m.text;
+  const t = document.createElement("div");
+  t.className = "time";
+  t.textContent = isPending ? "sending…" : fmtTime(m.ts);
+  row.append(b, t);
+  log.appendChild(row);
+  log.scrollTop = log.scrollHeight;       // auto-scroll to newest
+  return row;
+}
+
+// ---------- incoming ----------
+function handleMsg(m) {
+  if (seen.has(m.id)) return;             // duplicate (history replay overlapping live message)
+  seen.add(m.id);
+  lastId = Math.max(lastId, m.id);
+
+  // Echo of a message I sent: confirm the pending bubble instead of drawing a second one.
+  if (m.client_id && pendingEls.has(m.client_id)) {
+    const row = pendingEls.get(m.client_id);
+    row.classList.remove("pending");
+    row.querySelector(".time").textContent = fmtTime(m.ts);
+    pendingEls.delete(m.client_id);
+    pending = pending.filter((p) => p.client_id !== m.client_id);
+    return;
+  }
+  render(m, false);
+}
+
+// ---------- connection ----------
+function sendJSON(obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) { ws.send(JSON.stringify(obj)); return true; }
+  return false;
+}
+
+function connect() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+
+  ws.onopen = () => {
+    retry = 0;
+    setStatus(true);
+    sendJSON({ type: "join", user, last_id: lastId });       // ask server to replay what we missed
+    pending.forEach((p) => sendJSON({ type: "msg", client_id: p.client_id, text: p.text })); // resend unconfirmed
+  };
+
+  ws.onmessage = (e) => {
+    let m;
+    try { m = JSON.parse(e.data); } catch { return; }
+    if (m.type === "history") (m.messages || []).forEach(handleMsg);
+    else if (m.type === "msg") handleMsg(m);
+  };
+
+  ws.onclose = () => {
+    setStatus(false);
+    const delay = Math.min(1000 * 2 ** retry, 10000);         // 1s, 2s, 4s, 8s, 10s...
+    retry++;
+    setTimeout(connect, delay);
+  };
+  ws.onerror = () => ws.close();
+}
+
+// ---------- outgoing ----------
+function sendMessage() {
+  const input = $("text");
+  const text = input.value.trim();
+  if (!text) return;
+  const client_id = newClientId();
+  pending.push({ client_id, text });                          // kept until the server echoes it back
+  pendingEls.set(client_id, render({ user, text, ts: Date.now() / 1000 }, true));
+  sendJSON({ type: "msg", client_id, text });                 // if offline, it is flushed on reconnect
+  input.value = "";
+  input.focus();
+}
+
+// ---------- start ----------
+function start(name) {
+  user = name;
+  localStorage.setItem("chat_user", name);
+  $("who").textContent = "Signed in as " + name;
+  $("login").hidden = true;
+  connect();
+}
+
+$("nameGo").onclick = () => { const n = $("nameIn").value.trim(); if (n) start(n); };
+$("nameIn").addEventListener("keydown", (e) => { if (e.key === "Enter") $("nameGo").click(); });
+$("send").onclick = sendMessage;
+$("text").addEventListener("keydown", (e) => { if (e.key === "Enter") sendMessage(); });
+
+$("nameIn").value = localStorage.getItem("chat_user") || "";
+$("nameIn").focus();
+</script>
+</body>
+</html>
