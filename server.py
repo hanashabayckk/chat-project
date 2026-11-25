@@ -80,7 +80,7 @@ async def ws_handler(ws):
                     await client.send(*row)
                 clients.add(client)
             elif m["type"] == "msg" and name:
-                await handle_message(name, m["text"])
+                await handle_message(name, m["text"], m.get("client_id"))
     except Exception as e:
         print("ws client error:", e)
     finally:
