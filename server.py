@@ -29,7 +29,7 @@ def history_after(last_id):
 
 # ---------- connected clients: each has an async send(id,sender,text,ts) ----------
 clients = set()
-
+seen_ids = set()   # (name, client_id) pairs already processed, used to ignore duplicates
 async def broadcast(mid, sender, text, ts):
     for c in list(clients):
         try:
@@ -37,10 +37,15 @@ async def broadcast(mid, sender, text, ts):
         except Exception:      # one broken client must not affect the others
             clients.discard(c)
 
-async def handle_message(name, text):
+async def handle_message(name, text, client_id=None):
     text = text.strip()
     if not text:
         return
+    if client_id:
+        key = (name, client_id)
+        if key in seen_ids:
+            return
+        seen_ids.add(key)
     mid, ts = save(name, text)
     metrics.record_message()
     await broadcast(mid, name, text, ts)
@@ -75,7 +80,7 @@ async def ws_handler(ws):
                     await client.send(*row)
                 clients.add(client)
             elif m["type"] == "msg" and name:
-                await handle_message(name, m["text"])
+                await handle_message(name, m["text"], m.get("client_id"))
     except Exception as e:
         print("ws client error:", e)
     finally:
