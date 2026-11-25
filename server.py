@@ -29,7 +29,7 @@ def history_after(last_id):
 
 # ---------- connected clients: each has an async send(id,sender,text,ts) ----------
 clients = set()
-
+seen_ids = set()   # (name, client_id) pairs already processed, used to ignore duplicates
 async def broadcast(mid, sender, text, ts):
     for c in list(clients):
         try:
