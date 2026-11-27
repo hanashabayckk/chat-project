@@ -1,9 +1,10 @@
 """Benchmark tests for the chat server (Student 4: network, testing and report).
 
-Measures three performance metrics for the report:
+Measures the performance metrics for the report:
   1. latency     - how long a message takes from sender to receiver
   2. compare     - the same latency test over both protocols (WebSocket+JSON vs raw TCP)
   3. scale       - latency/throughput as the number of connected clients grows
+  4. catchup     - additional-feature comparison: reconnect with full history vs few missed messages
 
 How it measures latency:
   A "sender" client puts the current time (time.perf_counter) inside the message text.
@@ -15,6 +16,7 @@ Usage (server must already be running):
   python tests/benchmark.py latency --host localhost --proto ws  --n 100
   python tests/benchmark.py compare --host localhost --n 100
   python tests/benchmark.py scale   --host localhost --proto ws  --clients 1 5 10 25 50 --msgs 30
+  python tests/benchmark.py catchup --host localhost --proto ws  --history 500
 
 Results are printed and saved as CSV files in tests/results/.
 """
@@ -38,23 +40,25 @@ RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results"
 class Client:
     """One test client speaking either protocol ('ws' or 'tcp').
 
-    on_msg(sender, text) is called for every chat message the server sends us.
+    on_msg(sender, text, msg_id) is called for every chat message the server sends us.
+    last_id tells the server which messages we already have (history replay starts after it).
     """
 
-    def __init__(self, proto, host, name, on_msg):
+    def __init__(self, proto, host, name, on_msg, last_id=NO_HISTORY):
         self.proto, self.host, self.name, self.on_msg = proto, host, name, on_msg
+        self.last_id = last_id
 
     async def start(self):
         if self.proto == "ws":
             # Protocol 1: WebSocket + JSON. First message is a "hello" with our name.
             self.ws = await connect(f"ws://{self.host}:{WS_PORT}")
             await self.ws.send(json.dumps({"type": "hello", "name": self.name,
-                                           "last_id": NO_HISTORY}))
+                                           "last_id": self.last_id}))
             self.task = asyncio.create_task(self._ws_reader())
         else:
             # Protocol 2: raw TCP, text lines "HELLO|name|last_id\n" and "MSG|text\n".
             self.reader, self.writer = await asyncio.open_connection(self.host, TCP_PORT)
-            self.writer.write(f"HELLO|{self.name}|{NO_HISTORY}\n".encode())
+            self.writer.write(f"HELLO|{self.name}|{self.last_id}\n".encode())
             await self.writer.drain()
             self.task = asyncio.create_task(self._tcp_reader())
 
@@ -63,7 +67,7 @@ class Client:
             async for raw in self.ws:
                 m = json.loads(raw)
                 if m.get("type") == "msg":
-                    self.on_msg(m["sender"], m["text"])
+                    self.on_msg(m["sender"], m["text"], m["id"])
         except Exception:
             pass
 
@@ -73,7 +77,7 @@ class Client:
                 # server line format: MSG|id|sender|text
                 parts = line.decode().rstrip("\n").split("|", 3)
                 if parts[0] == "MSG" and len(parts) == 4:
-                    self.on_msg(parts[2], parts[3])
+                    self.on_msg(parts[2], parts[3], int(parts[1]))
         except Exception:
             pass
 
@@ -104,7 +108,7 @@ async def measure(proto, host, n_receivers, n_msgs, timeout=5.0):
     latencies = []                  # one entry per (message, receiver) delivery
     waiting = {}                    # seq -> [receivers still missing, future]
 
-    def on_receive(sender, text):
+    def on_receive(sender, text, mid=None):
         if not text.startswith("bench:"):
             return                  # ignore anything that is not our test message
         _, seq, t_sent = text.split(":")
@@ -116,7 +120,7 @@ async def measure(proto, host, n_receivers, n_msgs, timeout=5.0):
         if entry[0] == 0 and not entry[1].done():
             entry[1].set_result(True)
 
-    sender = Client(proto, host, "bench_sender", lambda s, t: None)
+    sender = Client(proto, host, "bench_sender", lambda s, t, mid=None: None)
     receivers = [Client(proto, host, f"bench_recv{i}", on_receive) for i in range(n_receivers)]
     await sender.start()
     for r in receivers:
@@ -139,6 +143,54 @@ async def measure(proto, host, n_receivers, n_msgs, timeout=5.0):
     for c in [sender] + receivers:
         await c.close()
     return latencies, lost, elapsed
+
+
+async def measure_catchup(proto, host, history_size, replay_sizes, reps):
+    """Compare reconnecting with a full history replay vs only the few missed messages.
+
+    1. A sender stores history_size messages on the server (persistent history).
+    2. A new client then connects with last_id set so the server must replay exactly k
+       messages, and we time how long it takes until the newest one arrives.
+    Returns {k: [time_ms for each repetition]}.
+    """
+    ids = []
+    sender = Client(proto, host, "hist_sender",
+                    lambda s, t, mid=None: ids.append(mid) if t.startswith("hist:") else None)
+    await sender.start()
+    await asyncio.sleep(0.5)
+    for i in range(history_size):
+        await sender.send(f"hist:{i}")
+    waited = 0
+    while len(ids) < history_size and waited < 60:      # wait until the server stored them all
+        await asyncio.sleep(0.1)
+        waited += 0.1
+    await sender.close()
+    if len(ids) < history_size:
+        raise SystemExit(f"only {len(ids)}/{history_size} messages were stored, aborting")
+    newest = max(ids)
+
+    results = {}
+    loop = asyncio.get_running_loop()
+    for k in replay_sizes:
+        results[k] = []
+        for _ in range(reps):
+            done = loop.create_future()
+
+            def on_msg(sender_name, text, mid=None, done=done):
+                if mid == newest and not done.done():
+                    done.set_result(True)
+
+            c = Client(proto, host, "hist_reader", on_msg, last_id=max(0, newest - k))
+            t0 = time.perf_counter()
+            await c.start()                              # connect + hello (asks for history)
+            try:
+                await asyncio.wait_for(done, 30)
+                results[k].append((time.perf_counter() - t0) * 1000)
+            except asyncio.TimeoutError:
+                results[k].append(float("nan"))
+            await c.close()
+            await asyncio.sleep(0.2)
+    return results
 
 
 def summarize(latencies):
@@ -213,6 +265,21 @@ async def cmd_scale(args):
              ["receivers", "messages", "mean_ms", "p95_ms", "lost", "deliveries_per_sec"], rows)
 
 
+async def cmd_catchup(args):
+    sizes = [k for k in args.replay if k <= args.history]
+    print(f"\nHistory catch-up on reconnect over {args.proto.upper()} "
+          f"({args.history} stored messages, {args.reps} reps each)")
+    res = await measure_catchup(args.proto, args.host, args.history, sizes, args.reps)
+    print(f"{'messages replayed':>18}{'median ms':>12}{'min ms':>10}{'max ms':>10}")
+    rows = []
+    for k, times in res.items():
+        med, lo, hi = statistics.median(times), min(times), max(times)
+        print(f"{k:>18}{med:>12.1f}{lo:>10.1f}{hi:>10.1f}")
+        rows.append([k, args.reps, round(med, 2), round(lo, 2), round(hi, 2)])
+    save_csv(f"history_catchup_{args.proto}.csv",
+             ["messages_replayed", "reps", "median_ms", "min_ms", "max_ms"], rows)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--host", default="localhost", help="server IP (default: localhost)")
@@ -232,6 +299,14 @@ def main():
     c.add_argument("--clients", type=int, nargs="+", default=[1, 5, 10, 25, 50])
     c.add_argument("--msgs", type=int, default=30, help="messages per step")
     c.set_defaults(fn=cmd_scale)
+
+    d = sub.add_parser("catchup", help="reconnect time: full history vs only missed messages")
+    d.add_argument("--proto", choices=["ws", "tcp"], default="ws")
+    d.add_argument("--history", type=int, default=500, help="messages to store first")
+    d.add_argument("--replay", type=int, nargs="+", default=[5, 50, 100, 500],
+                   help="how many messages the reconnecting client must receive")
+    d.add_argument("--reps", type=int, default=5)
+    d.set_defaults(fn=cmd_catchup)
 
     args = p.parse_args()
     asyncio.run(args.fn(args))
